@@ -1,202 +1,160 @@
-"""
-Created by Lorenzo Mambretti
-on 11/18/2017
+from __future__ import absolute_import, division, print_function
 
-My idea is to use a Neural Network in tensorflow to predict a past state (and action) given the current state
-Once we have this prediction, we update the q-matrix updating the previous state of each state
-
-"""
-
-import gym
+import base64
+import imageio
 import numpy as np
+import PIL.Image
+
 import tensorflow as tf
-import random
 
-env = gym.make('MountainCar-v0')
-max_attempts = 20
-epsilon = 0.1
+from tf_agents.agents.dqn import dqn_agent
+from tf_agents.drivers import dynamic_step_driver
+from tf_agents.environments import suite_gym
+from tf_agents.environments import tf_py_environment
+from tf_agents.eval import metric_utils
+from tf_agents.metrics import tf_metrics
+from tf_agents.networks import q_network
+from tf_agents.policies import random_tf_policy
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
+from tf_agents.trajectories import trajectory
+from tf_agents.utils import common
 
-dx = 20
-dy = 200
+tf.compat.v1.enable_v2_behavior()
 
-# create the q-matrix with the right dimensions
-n_actions = env.action_space.n
-state_max, state_min = env.observation_space.high, env.observation_space.low
-n_x = int(state_max[0]*dx - state_min[0]*dx)
-n_y = int(state_max[1]*dy-state_min[1]*dy)
-n_states = n_x * n_y
-q_matrix = np.zeros((n_x, n_y,n_actions))
+#### Hyperparameters
 
-def random_ride(x_size, y_size):
+num_iterations = 20000
+initial_collect_steps = 1000
+collect_steps_per_iteration = 1
+replay_buffer_max_length = 100000
 
-    n_iteration = 200
+batch_size = 64
+learning_rate = 1e-3
+log_interval = 200
 
-    inputs = np.zeros((0,x_size))
-    outputs = np.zeros((0,y_size))
-    
-    for _ in range(100):
-        env.reset()
-        action = env.action_space.sample()
-        for t in range(n_iteration):
+num_eval_episodes = 10
+eval_interval = 1000
 
-            # read the observation and convert them
-            observation, reward, done, info = env.step(action)
-            observation[0] = np.floor(observation[0] * dx)/dx
-            observation[1] = np.floor(observation[1] * dy)/dy
+#### Environment
 
-            if t < n_iteration - 1:
-                if y_size == 3:
-                    outputs = np.append(outputs,[[observation[0],observation[1],action]], axis = 0)
-                else:
-                    outputs = np.append(outputs,[[observation[0],observation[1]]], axis = 0)
-            if t > 0:
-                if x_size == 2:
-                    inputs = np.append(inputs,[[observation[0],observation[1]]],axis = 0)
-                else:
-                    inputs = np.append(inputs,[[observation[0],observation[1],action]],axis = 0)         
-        
-            action = env.action_space.sample()
+env_name = 'MountainCar-v0'
+env = suite_gym.load(env_name)
 
-    return inputs, outputs
+train_py_env = suite_gym.load(env_name)
+eval_py_env = suite_gym.load(env_name)
 
-def correct(state):
-    prob_x = int(state[0,0] * dx - state_min[0] * dx)
-    prob_y = int(state[0,1] * dy - state_min[1] * dy)
-    orig_x = prob_x
-    orig_y = prob_y
-    keep_going = True
-    while (keep_going):
-        keep_going = False
-        if prob_x < 0:
-            prob_x = 0
-            keep_going = True
-        if prob_y < 0:
-            prob_y = 0
-            keep_going = True
-        if prob_x >= n_x -1:
-            prob_x = n_x - 2
-            keep_going = True
-        if prob_y >= n_y -1:
-            prob_y = n_y - 2
-            keep_going = True
-        if prob_x == orig_x:
-            prob_x += (random.randint(0,1)*2)-1
-            keep_going = True
-        if prob_y == orig_y:
-            prob_y += (random.randint(0,1)*2)-1
-            keep_going = True
-    return prob_x, prob_y
+train_env = tf_py_environment.TFPyEnvironment(train_py_env)
+eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
 
-class nn():
-    def __init__(self,x_size,y_size):
-        self.x_size = x_size
-        self.y_size = y_size
-        self.x = tf.placeholder(tf.float32, [None,x_size])
-        self.W = tf.Variable(tf.random_uniform([x_size,y_size]))
-        self.b = tf.Variable(tf.zeros([y_size]))
+#### Agent
 
-        self.p = tf.tanh(tf.matmul(self.x,self.W)+self.b)
+fc_layer_params = (100,)
 
-        self.y = tf.placeholder(tf.float32, [None, y_size])
+q_net = q_network.QNetwork(
+    train_env.observation_spec(),
+    train_env.action_spec(),
+    fc_layer_params=fc_layer_params)
 
-        #the learning rate of the Gradient Descent Optimizer
-        lr = 0.01
-        
-        squared_deltas = tf.square(self.p - self.y)
-        self.loss = tf.reduce_mean(squared_deltas)
-        self.train_step = tf.train.GradientDescentOptimizer(lr).minimize(self.loss)
-        self.sess = tf.InteractiveSession()
+optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=learning_rate)
 
-    def train(self):
-        
-        tf.global_variables_initializer().run()
+train_step_counter = tf.Variable(0)
 
-        i,o = random_ride(self.x_size, self.y_size)
+agent = dqn_agent.DqnAgent(
+    train_env.time_step_spec(),
+    train_env.action_spec(),
+    q_network=q_net,
+    optimizer=optimizer,
+    td_errors_loss_fn=common.element_wise_squared_loss,
+    train_step_counter=train_step_counter)
 
-        print("Start training probability network")
-    
-        for j in range(10001):
-            aslice = random.randint(0,len(i)-501)
-            batch_xs = i[aslice:aslice+500]
-            batch_ys = o[aslice:aslice+500]
-            self.sess.run(self.train_step, feed_dict={self.x: batch_xs, self.y: batch_ys})
-            if j%10000 == 0:
-                # Test trained model
-                print("loss = ", self.sess.run(self.loss, feed_dict={self.x: i,
-                                                  self.y: o}))
-        print("Training completed")
+agent.initialize()
 
-    def predict_state(self,data):
-        return self.sess.run(self.p, feed_dict={self.x: data})
-             
+#### Policies
 
-def choose_action(q_matrix,observation):
-    x = int(observation[0]*dx-state_min[0]*dx)
-    y = int(observation[1]*dy-state_min[1]*dy)
-    return np.argmax(q_matrix[x,y,:])
+random_policy = random_tf_policy.RandomTFPolicy(train_env.time_step_spec(),
+                                                train_env.action_spec())
 
-def train(past_nn, future_nn):
-    
-    print("Start RL training")
-    n_iteration = 50
-    
-    for z in range(100):
-        difference = 0
-        for i in range(n_x):
-            for j in range(n_y):
-                    
-                obs1 = (i + dx * state_min[0]) / dx
-                obs2 = (j + dy * state_min[1]) / dy
-                probable_state  = past_nn.predict_state([[obs1,obs2]])
+#### Metrics and Evaluation
 
-                prob_x, prob_y = correct(probable_state)
-                
-                future_reward = np.max(q_matrix[i, j,:])
-                for action in range(n_actions):
+def compute_avg_return(environment, policy, num_episodes=10):
 
-                    # update previous state
-                    if i == n_x-1:
-                        current_reward = 1
-                    else: current_reward = 0
-                    
-                    difference += abs(q_matrix[prob_x,prob_y,action]-(current_reward + future_reward))
-                    if action == 1: probability = probable_state[0,2]
-                    else: probability = 1 - probable_state[0,2]
-                    q_matrix[prob_x,prob_y,action] = current_reward + probability * future_reward
+  total_return = 0.0
+  for _ in range(num_episodes):
 
-                    # update current state
-                    prob_x, prob_y = correct(future_nn.predict_state([[i,j,action]]))
+    time_step = environment.reset()
+    episode_return = 0.0
 
-                    q_matrix[i,j,action] = current_reward + np.max(q_matrix[prob_x,prob_y])
-                    
+    while not time_step.is_last():
+      action_step = policy.action(time_step)
+      time_step = environment.step(action_step.action)
+      episode_return += time_step.reward
+    total_return += episode_return
 
-        if difference < (epsilon/n_states):
-            print("Reinforcement Learning terminated after iteration",z)
-            break
+  avg_return = total_return / num_episodes
+  return avg_return.numpy()[0]
 
-    print("Q-matrix optimization completed!")
-    
-    return q_matrix
+#### Replay Buffer
 
-def run_game(q_matrix):
-    observation = env.reset()
-    action = env.action_space.sample()
-    for t in range(1000):
-        observation, reward, done, info = env.step(action)
-        observation[0] = np.floor(observation[0] * dx) / dx
-        observation[1] = np.floor(observation[1] * dy) / dy
-        env.render()
-        
-        action = choose_action(q_matrix,observation)
+replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+    data_spec=agent.collect_data_spec,
+    batch_size=train_env.batch_size,
+    max_length=replay_buffer_max_length)
 
-        """
-        if done:
-            print("Episode finished after {} timesteps".format(t+1))
-            break"""
+#### Data Collection
 
-past_nn = nn(2,3)
-past_nn.train()
-future_nn = nn(3,2)
-future_nn.train()
-q_matrix = train(past_nn, future_nn)
-run_game(q_matrix)
+def collect_step(environment, policy, buffer):
+  time_step = environment.current_time_step()
+  action_step = policy.action(time_step)
+  next_time_step = environment.step(action_step.action)
+  traj = trajectory.from_transition(time_step, action_step, next_time_step)
+
+  # Add trajectory to the replay buffer
+  buffer.add_batch(traj)
+
+def collect_data(env, policy, buffer, steps):
+  for _ in range(steps):
+    collect_step(env, policy, buffer)
+
+collect_data(train_env, random_policy, replay_buffer, steps=100)
+
+dataset = replay_buffer.as_dataset(
+    num_parallel_calls=3,
+    sample_batch_size=batch_size,
+    num_steps=2).prefetch(3)
+
+iterator = iter(dataset)
+
+
+#### Training the Agent
+
+
+# (Optional) Optimize by wrapping some of the code in a graph using TF function.
+agent.train = common.function(agent.train)
+
+# Reset the train step
+agent.train_step_counter.assign(0)
+
+# Evaluate the agent's policy once before training.
+avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
+returns = [avg_return]
+
+for _ in range(num_iterations):
+
+    for _ in range(collect_steps_per_iteration):
+        collect_step(train_env, agent.collect_policy, replay_buffer)
+
+    experience, unused_info = next(iterator)
+    train_loss = agent.train(experience).loss
+    step = agent.train_step_counter.numpy()
+
+    if step % log_interval == 0:
+        print('step = {0}: loss = {1}'.format(step, train_loss))
+
+    if step % eval_interval == 0:
+        avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
+    print('step = {0}: Average Return = {1}'.format(step, avg_return))
+    returns.append(avg_return)
+
+
+returnsArray = np.asarray(returns)
+np.save("returns", returnsArray)
