@@ -1,6 +1,6 @@
 # MountainCar-v0
 Reinforcement Learning algorithm to solve MountainCar-v0 in OpenAI gym. It uses
-the DQN agent by tf-agents library
+the DDQN agent by tf-agents library
 
 ## Set up
 The environment is created and run in a docker container. To create the docker
