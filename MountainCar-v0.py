@@ -19,6 +19,9 @@ from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.trajectories import trajectory
 from tf_agents.utils import common
 
+from data_collection import collect_data, collect_step
+from metrics import compute_avg_return
+
 tf.compat.v1.enable_v2_behavior()
 
 #### Hyperparameters
@@ -48,18 +51,16 @@ eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
 
 #### Agent
 
-fc_layer_params = (100,)
-
 q_net = q_network.QNetwork(
     train_env.observation_spec(),
     train_env.action_spec(),
-    fc_layer_params=fc_layer_params)
+    fc_layer_params=(75,40))
 
 optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=learning_rate)
 
 train_step_counter = tf.Variable(0)
 
-agent = dqn_agent.DqnAgent(
+agent = dqn_agent.DdqnAgent(
     train_env.time_step_spec(),
     train_env.action_spec(),
     q_network=q_net,
@@ -74,25 +75,6 @@ agent.initialize()
 random_policy = random_tf_policy.RandomTFPolicy(train_env.time_step_spec(),
                                                 train_env.action_spec())
 
-#### Metrics and Evaluation
-
-def compute_avg_return(environment, policy, num_episodes=10):
-
-  total_return = 0.0
-  for _ in range(num_episodes):
-
-    time_step = environment.reset()
-    episode_return = 0.0
-
-    while not time_step.is_last():
-      action_step = policy.action(time_step)
-      time_step = environment.step(action_step.action)
-      episode_return += time_step.reward
-    total_return += episode_return
-
-  avg_return = total_return / num_episodes
-  return avg_return.numpy()[0]
-
 #### Replay Buffer
 
 replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
@@ -100,22 +82,7 @@ replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
     batch_size=train_env.batch_size,
     max_length=replay_buffer_max_length)
 
-#### Data Collection
-
-def collect_step(environment, policy, buffer):
-  time_step = environment.current_time_step()
-  action_step = policy.action(time_step)
-  next_time_step = environment.step(action_step.action)
-  traj = trajectory.from_transition(time_step, action_step, next_time_step)
-
-  # Add trajectory to the replay buffer
-  buffer.add_batch(traj)
-
-def collect_data(env, policy, buffer, steps):
-  for _ in range(steps):
-    collect_step(env, policy, buffer)
-
-collect_data(train_env, random_policy, replay_buffer, steps=100)
+collect_data(train_env, random_policy, replay_buffer, steps=initial_collect_steps)
 
 dataset = replay_buffer.as_dataset(
     num_parallel_calls=3,
@@ -124,9 +91,7 @@ dataset = replay_buffer.as_dataset(
 
 iterator = iter(dataset)
 
-
 #### Training the Agent
-
 
 # (Optional) Optimize by wrapping some of the code in a graph using TF function.
 agent.train = common.function(agent.train)
@@ -152,9 +117,8 @@ for _ in range(num_iterations):
 
     if step % eval_interval == 0:
         avg_return = compute_avg_return(eval_env, agent.policy, num_eval_episodes)
-    print('step = {0}: Average Return = {1}'.format(step, avg_return))
-    returns.append(avg_return)
-
+        print('step = {0}: Average Return = {1}'.format(step, avg_return))
+        returns.append(avg_return)
 
 returnsArray = np.asarray(returns)
 np.save("returns", returnsArray)
